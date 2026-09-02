@@ -11,7 +11,7 @@ from model import LLM
 from transformers import AutoTokenizer
 
 class Trainer():
-    def __init__(self, model, tokenizer, optimizer, scheduler, loss = cross_entropy_loss):
+    def __init__(self, tokenizer, model, optimizer, scheduler, loss = cross_entropy_loss):
         self.model = model
         self.tok = tokenizer
         self.loss = loss
@@ -26,7 +26,7 @@ class Trainer():
         # x of shape (b, s)
         if target == None:
             target = x[:, 1:]
-        loss, grad_o = self.loss(pred, target)
+        loss, grad_o = self.loss(pred, target, self.pad)
         self.losses.append(loss)
         # I might have to redefine loss in loss.py or smth but I want to mask out the loss on padding tokens
         # meaning in the loss if the thing is a padding token don't count it towards loss
@@ -41,3 +41,5 @@ class Trainer():
 
     def loss(self, n: int):
         return self.losses[::n]
+
+# I think I first want to try out with like a 50M param deep model, and train overnight on datasets
