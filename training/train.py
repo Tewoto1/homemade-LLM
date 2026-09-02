@@ -283,6 +283,14 @@ def main():
     # Nothing here builds an autograd graph, so torch should not either
     torch.set_grad_enabled(False)
 
+    # TF32 is OFF by default in torch for matmul. Turning it on runs fp32 matmuls
+    # through the tensor cores at reduced mantissa: on a 5080 that is 112 TFLOPS
+    # instead of 56, for free, and the lost mantissa bits are far below the noise
+    # floor of SGD. Everything else (LayerNorm's variance, the loss) stays fp32.
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     if args.smoke:
         torch.manual_seed(0)
         model = LLM(**CONFIG_TINY)
