@@ -216,15 +216,22 @@ class Trainer():
         return float(loss), norm, n_valid
 
     def train(self, steps, batch_size, log_every = 10, ckpt_every = 0):
-        t0 = time.time()
+        # Rate is measured over the last log window, not from the start of the run.
+        # A cumulative average never sheds the first step, which pays for CUDA context
+        # setup and every allocation the caching allocator has not made yet -- over a
+        # short probe that alone can understate steady-state throughput by 2x.
+        last_t, last_step = time.time(), self.step_count
         for _ in range(steps):
             x, y = self.data.get_batch(batch_size)
             loss, norm, n_valid = self.train_single_step(x, y)
             if log_every and self.step_count % log_every == 0:
-                per_step = (time.time() - t0) / max(1, self.step_count)
+                now = time.time()
+                done = self.step_count - last_step
+                per_step = (now - last_t) / max(1, done)
+                last_t, last_step = now, self.step_count
                 print(f"step {self.step_count:>6} | loss {loss:7.4f} | ppl {math.exp(min(loss, 20)):>9.2f} "
                       f"| lr {self.sched.lr:.2e} | grad {norm:7.3f} "
-                      f"| {per_step:.3f}s/step | {n_valid * batch_size / per_step / batch_size:,.0f} tok/s",
+                      f"| {per_step:.3f}s/step | {n_valid / per_step:,.0f} tok/s",
                       flush = True)
             if ckpt_every and self.step_count % ckpt_every == 0:
                 self.save(os.path.join(self.ckpt_dir, f"step_{self.step_count}.pt"))
