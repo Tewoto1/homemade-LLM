@@ -54,12 +54,19 @@ def named_gradients(model):
 
 def clip_grad_norm(model, max_norm):
     """Scale gradients down in place if the global norm exceeds max_norm.
-    Returns the norm before clipping -- it spikes well before the loss does."""
+    Returns the norm before clipping -- it spikes well before the loss does.
+
+    The norm is reduced on-device and read back ONCE. Calling float() per tensor
+    instead would be ~100 GPU-to-CPU syncs per step, each one stalling the pipeline
+    while everything queued behind it drains -- enough to dominate step time on a
+    fast card, for a number that is only used for logging and one comparison.
+    """
     grads = [g for _, g in named_gradients(model)]
-    norm = sum(float(g.pow(2).sum()) for g in grads) ** 0.5
+    norm = float(torch.stack([g.pow(2).sum() for g in grads]).sum().sqrt())
     if max_norm and norm > max_norm:
+        scale = max_norm / (norm + 1e-6)
         for g in grads:
-            g.mul_(max_norm / (norm + 1e-6))
+            g.mul_(scale)
     return norm
 
 

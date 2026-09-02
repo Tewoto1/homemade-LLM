@@ -1,0 +1,5 @@
+torch>=2.0
+numpy
+# only needed for training/train.py --prepare
+transformers
+datasets

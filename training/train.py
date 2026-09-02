@@ -273,6 +273,7 @@ def main():
     ap.add_argument("--warmup", type = int, default = 200)
     ap.add_argument("--resume", type = str, default = None)
     ap.add_argument("--ckpt-every", type = int, default = 1000)
+    ap.add_argument("--log-every", type = int, default = 10)
     args = ap.parse_args()
 
     if args.prepare:
@@ -313,7 +314,7 @@ def main():
         trainer = Trainer(model, data, sched)
 
     print(f"training on {args.device}, {len(data):,} positions available")
-    trainer.train(args.steps, args.batch, ckpt_every = args.ckpt_every)
+    trainer.train(args.steps, args.batch, log_every = args.log_every, ckpt_every = args.ckpt_every)
     trainer.save(os.path.join(trainer.ckpt_dir, "final.pt"))
 
 
