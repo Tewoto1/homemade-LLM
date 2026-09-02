@@ -135,7 +135,7 @@ class Attention():
         # grad_almost is also easy, since it's grad_o * W_O^T
         grad_almost = torch.matmul(grad_o, self.W_O.T) # shape (b, s, h*d)
         # Next we get grad_V and grad_attn
-        grad_almost = grad_almost.view(b, s, self.heads, self.input_dim).permute(0, 2, 1, 3) # shape (b, h, s, d)
+        grad_almost = grad_almost.view(b, s, self.heads, self.hidden).permute(0, 2, 1, 3) # shape (b, h, s, d)
         grad_V = torch.matmul(self.attn.transpose(-2, -1), grad_almost) # shape (b, h, s, d)
         grad_attn = torch.matmul(grad_almost, self.V.transpose(-2, -1)) # shape (b, h, s, s)
         # Use grad_V to get grad_W_V and grad_x, since V = x * W_V
@@ -159,7 +159,7 @@ class Attention():
         grad_x_Q = torch.matmul(grad_Q, self.W_Q.T).view(b, s, self.input_dim)
         grad_x_K = torch.matmul(grad_K, self.W_K.T).view(b, s, self.input_dim)
         # Finally, grad_x is the sum of grad_x_V, grad_x_Q, and grad_x_K, plus the residual connection from grad_o
-        self.grad_x = grad_x_V + grad_x_Q + grad_x_K + grad_o
+        self.grad_x = grad_x_V + grad_x_Q + grad_x_K
         return self.grad_x
 
     def step(self, lr):
