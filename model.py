@@ -3,7 +3,7 @@ Building an LLM from scratch v1, simple, like 2016 after attention is all you ne
 """
 import torch             # pyright: ignore[reportMissingImports] FUCK YOU PYRIGHT
 from torch import nn     # pyright: ignore[reportMissingImports]
-from itertools import reduce
+from functools import reduce
 # Using nn for the Params class, nice for keeping track of things
 
 # First defining linear layers and attention layers
@@ -79,6 +79,10 @@ class Attention():
         self.grad_W_K = torch.zeros_like(self.W_K)
         self.grad_W_V = torch.zeros_like(self.W_V)
         self.grad_W_O = torch.zeros_like(self.W_O)
+        # Inference-only K/V cache, kept separate from self.K / self.V so a cached
+        # generation run never clobbers the intermediates training needs
+        self.K_cache = None
+        self.V_cache = None
 
     def forward(self, x: torch.Tensor, mask: bool = True):
         # DO NOT DO BEFORE BACKWARD
@@ -103,29 +107,38 @@ class Attention():
     def __call__(self, x):
         return self.forward(x)
 
-    def forward_KV_cache(self, x: torch.Tensor, mask: bool = False):
-        # Under not RoPE, if we extend past max token length we would have to recalculate all the KV again, since their pos embedding changes
-        # Assuming for now though that length of x is small
-        prev_cached = True
-        if (self.x == 0).all().item(): self.x = x; prev_cached = False
-        else: self.x = torch.cat([self.x, x.unsqueeze(1)], dim = 1)
-        b, _, _ = x.shape # now x of shape (b, 1, id)
-        # pretty much just calculate the entire KV cache by calculating Q and V
-        new_Q = torch.matmul(x, self.W_Q).view(b, 1, self.heads, self.hidden).permute(0, 2, 1, 3)
-        new_K = torch.matmul(x, self.W_K).view(b, 1, self.heads, self.hidden).permute(0, 2, 1, 3)
-        new_V = torch.matmul(x, self.W_V).view(b, 1, self.heads, self.hidden).permute(0, 2, 1, 3)
-        # TODO: I had this problem where I made V be input_dim instead of hidden_dim, need to check if this is fixed overall
-        if prev_cached:
-            self.K = torch.cat([self.K, new_K], dim = 2)
-            self.V = torch.cat([self.V, new_V], dim = 2) # all of shape (b, h, s+1, d)
+    def reset_cache(self):
+        self.K_cache = None
+        self.V_cache = None
+
+    def forward_KV_cache(self, x: torch.Tensor):
+        """Inference-only forward that reads and extends the K/V cache.
+
+        x is (b, t, id): t = prompt length on the prefill call, t = 1 for every
+        decode step after it. Only K and V are cached.
+        this path is not differentiable.
+        """
+        b, t, _ = x.shape
+        new_Q = torch.matmul(x, self.W_Q).view(b, t, self.heads, self.hidden).permute(0, 2, 1, 3) # (b, h, t, d)
+        new_K = torch.matmul(x, self.W_K).view(b, t, self.heads, self.hidden).permute(0, 2, 1, 3)
+        new_V = torch.matmul(x, self.W_V).view(b, t, self.heads, self.hidden).permute(0, 2, 1, 3)
+        if self.K_cache is None:
+            n_cached = 0
+            self.K_cache, self.V_cache = new_K, new_V
         else:
-            self.K = new_K
-            self.V = new_V
-        scores = torch.matmul(new_Q, self.K.transpose(-2, -1))
+            n_cached = self.K_cache.shape[2]
+            self.K_cache = torch.cat([self.K_cache, new_K], dim = 2) # (b, h, n_cached + t, d)
+            self.V_cache = torch.cat([self.V_cache, new_V], dim = 2)
+        scores = torch.matmul(new_Q, self.K_cache.transpose(-2, -1)) / (self.hidden ** 0.5) # (b, h, t, n_cached + t)
+        if t > 1:
+            # New query i sits at absolute position n_cached + i, so it may see key j <= n_cached + i.
+            # tril with diagonal = n_cached is exactly that (t, n_cached + t) mask.
+            mask = torch.tril(torch.ones(t, n_cached + t, device = x.device), diagonal = n_cached)
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        # t == 1 needs no mask: the single new token is the newest position, it may see everything cached
         attn = torch.softmax(scores, dim = -1)
-        almost = torch.matmul(attn, self.V).permute(0, 2, 1, 3).contiguous().view(b, 1, self.heads * self.input_dim)
-        output = torch.matmul(almost, self.W_O)
-        return output
+        almost = torch.matmul(attn, self.V_cache).permute(0, 2, 1, 3).contiguous().view(b, t, self.heads * self.hidden)
+        return torch.matmul(almost, self.W_O) # (b, t, id)
 
     def backward(self, grad_o: torch.Tensor):
         """Attention backwards is a bit complicated"""
@@ -314,6 +327,15 @@ class Transformer_Block():
     def __call__(self, x):
         return self.forward(x)
 
+    def forward_KV_cache(self, x: torch.Tensor):
+        # Same pre-norm shape as forward, but attention reads/extends its cache
+        x = x + self.attn.forward_KV_cache(self.LN1.forward(x))
+        x = x + self.MLP.forward(self.LN2.forward(x))
+        return x
+
+    def reset_cache(self):
+        self.attn.reset_cache()
+
     def backward(self, grad_o: torch.Tensor):
         grad_o = self.MLP.backward(grad_o)
         grad_o = self.LN2.backward(grad_o)
@@ -361,13 +383,17 @@ class Embed():
             self.grad_pos_embed = torch.zeros(max_s, hidden_dim)
         # For backwards computation later
         self.x = torch.zeros(1, 1)
+        self.offset = 0
         self.grad_tok_embed = torch.zeros(vocab_size, hidden_dim)
 
-    def forward(self, x: torch.Tensor):
-        # x of shape (b, s)
+    def forward(self, x: torch.Tensor, offset: int = 0):
+        # x of shape (b, s). offset is where this chunk starts in the sequence:
+        # 0 for training and for prefill, but n_cached during cached decoding,
+        # where the single new token is not at position 0
         self.x = x
+        self.offset = offset
         b, s = x.shape
-        return self.tok_embed[x] + self.pos_embed[:s].unsqueeze(0)
+        return self.tok_embed[x] + self.pos_embed[offset:offset + s].unsqueeze(0)
 
     def __call__(self, x: torch.Tensor):
         return self.forward(x)
@@ -378,7 +404,7 @@ class Embed():
         self.grad_tok_embed.index_add_(0, self.x.reshape(-1), grad_o.reshape(b * s, -1)) # 0 says we are indexing along the 0 dimension
         if (self.pos_embed_type == "random"):
             self.grad_pos_embed = torch.zeros_like(self.pos_embed)
-            self.grad_pos_embed[:s] += grad_o.sum(dim = (0))
+            self.grad_pos_embed[self.offset:self.offset + s] += grad_o.sum(dim = (0))
         return None
 
     def step(self, lr):
@@ -411,61 +437,122 @@ class LLM():
         }
         self.embed = Embed(hid_dim, vocab_size, pos_embed, max_s)
         self.layers = [Transformer_Block(hid_dim, attn_dim, heads) for _ in range(layers)]
-        self.ln_f = linear(hid_dim, vocab_size)
+        # Pre-norm means nothing renormalizes the residual stream after the last block
+        self.ln_f = LayerNorm(hid_dim)
+        # Unembedding / vocab projection
+        self.head = linear(hid_dim, vocab_size)
+        # How many positions currently sit in the K/V caches; doubles as the position offset
+        self._cache_len = 0
 
     def forward(self, x):
-        o = self.embed(x)
-        for block in self.blocks:
-            o = block.forward(o)
-        o = self.ln_f.forward(o)
-        return self.head.forward(o)
+        # x of shape (b, s) of token ids
+        o = self.embed.forward(x)            # (b, s, hid)
+        for block in self.layers:
+            o = block.forward(o)             # (b, s, hid)
+        o = self.ln_f.forward(o)             # (b, s, hid)
+        return self.head.forward(o)          # (b, s, vocab)
 
     def __call__(self, x):
         return self.forward(x)
 
     def backward(self, grad_o):
+        # grad_o is dL/dlogits, shape (b, s, vocab)
+        grad_o = self.head.backward(grad_o)   # (b, s, hid)
         grad_o = self.ln_f.backward(grad_o)
-        for layer in self.layers:
-            grad_o = layer.backward(grad_o)
-        grad_o = self.embed.backward(grad_o)
-        return grad_o
+        for block in reversed(self.layers):   # reversed: gradient flows last block -> first
+            grad_o = block.backward(grad_o)
+        return self.embed.backward(grad_o)    # returns None, embed is the end of the chain
 
     def step(self, lr):
         self.embed.step(lr)
         for layer in self.layers:
             layer.step(lr)
         self.ln_f.step(lr)
+        self.head.step(lr)
 
     def zero_grad(self):
         self.embed.zero_grad()
         for layer in self.layers:
             layer.zero_grad()
         self.ln_f.zero_grad()
+        self.head.zero_grad()
 
     # Generate sentences
+    def _sample(self, logits: torch.Tensor, temperature: float = 1.0, topk: int = None):
+        # logits of shape (b, vocab): one row per sequence, already the last position
+        logits = logits / temperature
+        if topk is not None:
+            v, _ = torch.topk(logits, min(topk, logits.shape[-1])) # (b, topk), sorted descending
+            logits = logits.masked_fill(logits < v[:, [-1]], float('-inf'))
+        prob = torch.softmax(logits, dim = -1)
+        return torch.multinomial(prob, num_samples = 1) # (b, 1), sampled not argmax so we do not loop
+
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, topk: int = None):
-        # idx is (b, s) or just s
-        if (len(idx.shape) == 1):
-            idx.unsqueeze(0)
+        """Naive generation: re-forwards the whole prefix every step. For training mode."""
+        # idx is (b, s) or just (s,)
+        if idx.dim() == 1:
+            idx = idx.unsqueeze(0)
         for _ in range(max_new_tokens):
             s = idx.shape[1]
-            idx_clip = idx if s < self.embed.max_seq_len else idx[:, -self.embed.max_seq_len:]
-            logits = self.forward(idx_clip) # (b, s, vocab)
-            logits = logits[:, -1, :] # (b, 1, vocab) last tok
-            logits = logits / temperature
-            if topk is not None:
-                v, _ = torch.topk(logits, topk)
-                logits[logits < v[:, -1]] = float('-inf')
-            prob = torch.softmax(logits, dim = -1)
-            next_id = torch.multinomial(prob, num_samples = 1) # shape (b, 1)
-            idx = torch.cat([idx, next_id], dim = 1) # shape (b, s+l) where l is the no. loops
+            idx_clip = idx if s <= self.embed.max_seq_len else idx[:, -self.embed.max_seq_len:]
+            logits = self.forward(idx_clip)                              # (b, s, vocab)
+            next_id = self._sample(logits[:, -1, :], temperature, topk)  # only the last position matters
+            idx = torch.cat([idx, next_id], dim = 1)
         return idx
 
-    # TODO: KV_cache generation
+    # KV cache generation
+    def reset_cache(self):
+        self._cache_len = 0
+        for block in self.layers:
+            block.reset_cache()
+
+    def forward_KV_cache(self, x: torch.Tensor):
+        """Cached forward. x is (b, t): the whole prompt on the prefill call, then (b, 1) per step."""
+        o = self.embed.forward(x, offset = self._cache_len) # the new token is not at position 0
+        for block in self.layers:
+            o = block.forward_KV_cache(o)
+        o = self.ln_f.forward(o)
+        self._cache_len += x.shape[1]
+        return self.head.forward(o) # (b, t, vocab)
+
+    def generate_KV_cache(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
+                          topk: int = None, on_token = None):
+        """Streaming single-sequence generation on top of the K/V cache.
+
+        One prefill pass over the whole prompt, then one forward per new token in
+        which the only thing computed is that token's own row -- everything before
+        it is read out of the cache. on_token, if given, is called with each new
+        token id the moment it is produced, which is what makes this stream.
+        """
+        if idx.dim() == 1:
+            idx = idx.unsqueeze(0)
+        if idx.shape[0] != 1:
+            raise ValueError("generate_KV_cache is single-sequence only for now; use generate() for batches")
+        max_s = self.embed.max_seq_len
+        idx = idx[:, -max_s:] # positions past max_seq_len have no embedding
+        self.reset_cache()
+        logits = self.forward_KV_cache(idx)[:, -1, :] # prefill, keep only the last position's logits
+        for i in range(max_new_tokens):
+            next_id = self._sample(logits, temperature, topk)
+            idx = torch.cat([idx, next_id], dim = 1)
+            if on_token is not None:
+                on_token(int(next_id.item()))
+            if i == max_new_tokens - 1:
+                break # the final token needs no follow-up forward
+            if self._cache_len >= max_s:
+                # Additive position embeddings run out here. Sliding the window would mean
+                # dropping the cache and re-forwarding, since every cached K/V carries a
+                # position that would shift. RoPE is what fixes this properly.
+                break
+            logits = self.forward_KV_cache(next_id)[:, -1, :]
+        return idx
 
     # General utils
     def params(self):
-        return self.embed.params() + self.ln_f.params() + [p for layer in self.layers for p in layer.params()]
+        return (self.embed.params()
+                + [p for layer in self.layers for p in layer.params()]
+                + self.ln_f.params()
+                + self.head.params())
 
     def param_count(self):
         return sum(p.numel() for p in self.params())
