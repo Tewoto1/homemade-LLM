@@ -4,7 +4,7 @@ Building an LLM from scratch v1, simple, like 2016 after attention is all you ne
 import torch             # pyright: ignore[reportMissingImports] FUCK YOU PYRIGHT
 from torch import nn     # pyright: ignore[reportMissingImports]
 from itertools import reduce
-import numpy
+# Using nn for the Params class, nice for keeping track of things
 
 # First defining linear layers and attention layers
 # Part of the challenge is to implement autograd
@@ -16,8 +16,8 @@ class linear():
             self.output_dim = output_dim
         else:
             self.output_dim = input_dim
-        self.W = nn.Parameter(torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim, output_dim)))
-        self.b = nn.Parameter(torch.zeros(output_dim))
+        self.W = nn.Parameter(torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim, self.output_dim)))
+        self.b = nn.Parameter(torch.zeros(self.output_dim))
         self.x = torch.zeros(1, 1, input_dim)  # Placeholder for input, will be set in forward
         # gradients
         self.grad_W = torch.zeros_like(self.W)
@@ -65,7 +65,7 @@ class Attention():
         # After Q_proj it's of shape (b, s, hid * heads), QK^T is (b, s, s)
         # After softmax it's (b, s, s), and V is (b, s, out)
         self.W_K = nn.Parameter(torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim,hidden_dim * num_heads)))
-        self.W_V = nn.Parameter(torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim, input_dim * num_heads)))
+        self.W_V = nn.Parameter(torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim, hidden_dim * num_heads)))
         self.W_O = nn.Parameter(torch.normal(0, (1/(2*(hidden_dim * num_heads))) ** 0.5, size = (hidden_dim * num_heads, input_dim)))
         # Intermediate vars for calculation of grads
         self.x = torch.zeros(1, 1, input_dim)
@@ -80,24 +80,51 @@ class Attention():
         self.grad_W_V = torch.zeros_like(self.W_V)
         self.grad_W_O = torch.zeros_like(self.W_O)
 
-    def forward(self, x: torch.Tensor, mask: bool = False):
+    def forward(self, x: torch.Tensor, mask: bool = True):
         # DO NOT DO BEFORE BACKWARD
         # x is of shape (batch_size, seq_len, input_dim)
         b, s, _ = x.shape
         self.x = x
         self.Q = torch.matmul(x, self.W_Q).view(b, s, self.heads, self.hidden).permute(0, 2, 1, 3) # shape (b, h, s, d)
         self.K = torch.matmul(x, self.W_K).view(b, s, self.heads, self.hidden).permute(0, 2, 1, 3) # shape (b, h, s, d)
-        self.V = torch.matmul(x, self.W_V).view(b, s, self.heads, self.input_dim).permute(0, 2, 1, 3) # shape (b, h, s, id) id for input_dim
+        self.V = torch.matmul(x, self.W_V).view(b, s, self.heads, self.hidden).permute(0, 2, 1, 3) # shape (b, h, s, d) id for input_dim
         mask = torch.tril(torch.ones(s, s, device=x.device))
         if mask is False:
             mask = torch.ones(s, s, device=x.device)
         scores = torch.matmul(self.Q, self.K.transpose(-2, -1)) / (self.hidden ** 0.5)
         scores = scores.masked_fill(mask == 0, float('-inf'))
         self.attn = torch.softmax(scores, dim = -1)
-        # attn of shape (b, h, s, s), V of shape (b, h, s, id), so multiply we get (b, h, s, id)
-        self.almost = torch.matmul(self.attn, self.V).permute(0, 2, 1, 3).contiguous().view(b, s, self.heads * self.input_dim).contiguous() # shape (b, s, h*id)
+        # attn of shape (b, h, s, s), V of shape (b, h, s, d), so multiply we get (b, h, s, d)
+        self.almost = torch.matmul(self.attn, self.V).permute(0, 2, 1, 3).contiguous().view(b, s, self.heads * self.hidden).contiguous() # shape (b, s, h*d)
         output = torch.matmul(self.almost, self.W_O) # shape (b, s, id)
         # In the actual forward pass, we add the attention to x as a residual connection
+        return output
+
+    def __call__(self, x):
+        return self.forward(x)
+
+    def forward_KV_cache(self, x: torch.Tensor, mask: bool = False):
+        # Under not RoPE, if we extend past max token length we would have to recalculate all the KV again, since their pos embedding changes
+        # Assuming for now though that length of x is small
+        prev_cached = True
+        if (self.x == 0).all().item(): self.x = x; prev_cached = False
+        else: self.x = torch.cat([self.x, x.unsqueeze(1)], dim = 1)
+        b, _, _ = x.shape # now x of shape (b, 1, id)
+        # pretty much just calculate the entire KV cache by calculating Q and V
+        new_Q = torch.matmul(x, self.W_Q).view(b, 1, self.heads, self.hidden).permute(0, 2, 1, 3)
+        new_K = torch.matmul(x, self.W_K).view(b, 1, self.heads, self.hidden).permute(0, 2, 1, 3)
+        new_V = torch.matmul(x, self.W_V).view(b, 1, self.heads, self.hidden).permute(0, 2, 1, 3)
+        # TODO: I had this problem where I made V be input_dim instead of hidden_dim, need to check if this is fixed overall
+        if prev_cached:
+            self.K = torch.cat([self.K, new_K], dim = 2)
+            self.V = torch.cat([self.V, new_V], dim = 2) # all of shape (b, h, s+1, d)
+        else:
+            self.K = new_K
+            self.V = new_V
+        scores = torch.matmul(new_Q, self.K.transpose(-2, -1))
+        attn = torch.softmax(scores, dim = -1)
+        almost = torch.matmul(attn, self.V).permute(0, 2, 1, 3).contiguous().view(b, 1, self.heads * self.input_dim)
+        output = torch.matmul(almost, self.W_O)
         return output
 
     def backward(self, grad_o: torch.Tensor):
@@ -106,14 +133,14 @@ class Attention():
         # first we find grad_W_O, which is easy, since o = almost * W_O, so grad_W_O = almost^T * grad_o
         self.grad_W_O = torch.matmul(self.almost.view(b*s, -1).T, grad_o.view(b*s, -1)) # shape (h*id, id)
         # grad_almost is also easy, since it's grad_o * W_O^T
-        grad_almost = torch.matmul(grad_o, self.W_O.T) # shape (b, s, h*id)
+        grad_almost = torch.matmul(grad_o, self.W_O.T) # shape (b, s, h*d)
         # Next we get grad_V and grad_attn
-        grad_almost = grad_almost.view(b, s, self.heads, self.input_dim).permute(0, 2, 1, 3) # shape (b, h, s, id)
-        grad_V = torch.matmul(self.attn.transpose(-2, -1), grad_almost) # shape (b, h, s, id)
+        grad_almost = grad_almost.view(b, s, self.heads, self.input_dim).permute(0, 2, 1, 3) # shape (b, h, s, d)
+        grad_V = torch.matmul(self.attn.transpose(-2, -1), grad_almost) # shape (b, h, s, d)
         grad_attn = torch.matmul(grad_almost, self.V.transpose(-2, -1)) # shape (b, h, s, s)
         # Use grad_V to get grad_W_V and grad_x, since V = x * W_V
-        grad_V = grad_V.permute(0, 2, 1, 3).contiguous().view(b*s, self.heads * self.input_dim) # shape (b*s, h*id)
-        self.grad_W_V = torch.matmul(self.x.view(b*s, -1).T, grad_V) # shape (input_dim, h*id)
+        grad_V = grad_V.permute(0, 2, 1, 3).contiguous().view(b*s, self.heads * self.hidden) # shape (b*s, h*d)
+        self.grad_W_V = torch.matmul(self.x.view(b*s, -1).T, grad_V) # shape (input_dim, h*d)
         grad_x_V = torch.matmul(grad_V, self.W_V.T).view(b, s, self.input_dim)
         # Now we need to get grad_scores from grad_attn
         # Say y = softmax(x) for a 1d vector, then dy/dx = diag(y) - y*y^T, so grad_x = grad_y * (diag(y) - y*y^T)
@@ -191,6 +218,9 @@ class LayerNorm():
         self.x_hat = (x - self.mean) / torch.sqrt(self.var + self.eps)
         return self.gamma * self.x_hat + self.b
 
+    def __call__(self, x):
+        return self.forward(x)
+
     def backward(self, grad_o: torch.Tensor):
         # Grad wrt gamma and b are easier
         # grad_o is of shape (b, s, id)
@@ -243,7 +273,7 @@ class MLP():
 
     def forward(self, x: torch.Tensor):
         for layer in self.layers:
-            x = layer(x)
+            x = layer.forward(x)
         return x
 
     def __call__(self, x):
@@ -415,6 +445,7 @@ class LLM():
         self.ln_f.zero_grad()
 
     # Generate sentences
+    # TODO: KV_cache generation speedup
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, topk: int = None):
         # idx is (b, s) or just s
         if (len(idx.shape) == 1):
