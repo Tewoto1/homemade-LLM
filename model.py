@@ -10,38 +10,54 @@ from functools import reduce
 # Part of the challenge is to implement autograd
 
 class linear():
-    def __init__(self, input_dim, output_dim = None):
+    def __init__(self, input_dim, output_dim = None, W = None, transpose = False):
+        # W borrows another layer's weight matrix instead of owning one (weight
+        # tying). transpose means it is stored (output_dim, input_dim) and used
+        # transposed -- the shape an embedding table has when used as an unembedding.
+        # A borrowed W goes in shared_params, so params(), step() and the checkpoint
+        # walker all skip it: the owner updates and saves it, once.
         self.input_dim = input_dim
         if output_dim:
             self.output_dim = output_dim
         else:
             self.output_dim = input_dim
-        self.W = nn.Parameter(torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim, self.output_dim)))
-        self.b = nn.Parameter(torch.zeros(self.output_dim))
+        self.transpose = transpose
+        self.shared_params = ("W",) if W is not None else ()
+        if W is not None:
+            self.W = W
+        else:
+            self.W = nn.Parameter(requires_grad = False, data = torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim, self.output_dim)))
+        self.b = nn.Parameter(requires_grad = False, data = torch.zeros(self.output_dim))
         self.x = torch.zeros(1, 1, input_dim)  # Placeholder for input, will be set in forward
         # gradients
         self.grad_W = torch.zeros_like(self.W)
         self.grad_b = torch.zeros_like(self.b)
     
+    def _W(self):
+        return self.W.T if self.transpose else self.W
+
     def forward(self, x: torch.Tensor):
         # Do not call before backward
         # x of shape (batch_size, seq_len, input_dim)
         self.x = x
-        return torch.matmul(x, self.W) + self.b
+        return torch.matmul(x, self._W()) + self.b
 
     def backward(self, grad_o: torch.Tensor):
         # grad_o of shape (batch_size, seq_len, output_dim)
         # Since o = Wx + b, df/dx_j = \sum df/do_i * do_i/dx_j = df/do * W_*j, so do/dx = grad_o * W^T
-        grad_x = torch.matmul(grad_o, self.W.T) # shape (batch_size, seq_len, input_dim)
+        grad_x = torch.matmul(grad_o, self._W().T) # shape (batch_size, seq_len, input_dim)
         # df/dW_ij = df/do_i * do_i/dW_ij and since o_i = \sum_j W_ij * x_j + b_i, do_i/dW_ij = x_j, so df/dW_ij = df/do_i * x_j
         # Keeping track of dim, self.x = (batch_size, seq_len, input_dim), grad_o = (batch_size, seq_len, output_dim), so grad_W = (input_dim, output_dim)
         self.grad_W = torch.matmul(self.x.transpose(-2, -1), grad_o) # shape (batch_size, input_dim, output_dim)
         self.grad_W = torch.sum(self.grad_W, dim = 0) # Sum over batch and sequence
+        if self.transpose:
+            self.grad_W = self.grad_W.T   # W is stored the other way round
         self.grad_b = torch.sum(grad_o, dim = (0, 1)) # Sum over batch and sequence
         return grad_x
 
     def step(self, lr):
-        self.W.data -= lr * self.grad_W
+        if not self.shared_params:
+            self.W.data -= lr * self.grad_W   # a borrowed W is stepped by its owner
         self.b.data -= lr * self.grad_b
 
 
@@ -50,7 +66,7 @@ class linear():
         self.grad_b = torch.zeros_like(self.b)
 
     def params(self):
-        return [self.W, self.b]
+        return [self.b] if self.shared_params else [self.W, self.b]
 
 
 # attention
@@ -61,12 +77,12 @@ class Attention():
         self.input_dim = input_dim
         self.hidden = hidden_dim
         self.heads = num_heads
-        self.W_Q = nn.Parameter(torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim, hidden_dim * num_heads)))
+        self.W_Q = nn.Parameter(requires_grad = False, data = torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim, hidden_dim * num_heads)))
         # After Q_proj it's of shape (b, s, hid * heads), QK^T is (b, s, s)
         # After softmax it's (b, s, s), and V is (b, s, out)
-        self.W_K = nn.Parameter(torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim,hidden_dim * num_heads)))
-        self.W_V = nn.Parameter(torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim, hidden_dim * num_heads)))
-        self.W_O = nn.Parameter(torch.normal(0, (1/(2*(hidden_dim * num_heads))) ** 0.5, size = (hidden_dim * num_heads, input_dim)))
+        self.W_K = nn.Parameter(requires_grad = False, data = torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim,hidden_dim * num_heads)))
+        self.W_V = nn.Parameter(requires_grad = False, data = torch.normal(0, (1/(2*input_dim)) ** 0.5, size = (input_dim, hidden_dim * num_heads)))
+        self.W_O = nn.Parameter(requires_grad = False, data = torch.normal(0, (1/(2*(hidden_dim * num_heads))) ** 0.5, size = (hidden_dim * num_heads, input_dim)))
         # Intermediate vars for calculation of grads
         self.x = torch.zeros(1, 1, input_dim)
         self.attn = torch.zeros(1, 1, 1, 1) # Placeholder for attention weights
@@ -213,16 +229,16 @@ class LayerNorm():
     def __init__(self, input_dim, eps = 1e-5):
         self.input_dim = input_dim
         self.eps = eps
-        self.gamma = nn.Parameter(torch.ones(input_dim))
-        self.b = nn.Parameter(torch.zeros(input_dim))
+        self.gamma = nn.Parameter(requires_grad = False, data = torch.ones(input_dim))
+        self.b = nn.Parameter(requires_grad = False, data = torch.zeros(input_dim))
         # Intermediate vars
         self.x = torch.zeros(1, 1, input_dim)
         self.mean = torch.zeros(1, 1, input_dim)
         self.var = torch.ones(1, 1, input_dim)
         self.x_hat = torch.zeros(1, 1, input_dim)
         # Gradients
-        self.grad_gamma = torch.zeros(input_dim)
-        self.grad_b = torch.zeros(input_dim)
+        self.grad_gamma = torch.zeros_like(self.gamma.data)
+        self.grad_b = torch.zeros_like(self.b.data)
 
     def forward(self, x:torch.Tensor):
         self.x = x # shape (b, s, id) 
@@ -258,8 +274,10 @@ class LayerNorm():
         self.b.data -= lr * self.grad_b
 
     def zero_grad(self):
-        self.grad_gamma = torch.zeros(self.input_dim)
-        self.grad_b = torch.zeros(self.input_dim)
+        # zeros_like, not torch.zeros(input_dim): the latter always lands on the CPU,
+        # which would quietly undo a to_device() on the very first zero_grad
+        self.grad_gamma = torch.zeros_like(self.gamma.data)
+        self.grad_b = torch.zeros_like(self.b.data)
 
     def params(self):
         return [self.gamma, self.b]
@@ -337,11 +355,9 @@ class Transformer_Block():
         self.attn.reset_cache()
 
     def backward(self, grad_o: torch.Tensor):
-        grad_o = self.MLP.backward(grad_o)
-        grad_o = self.LN2.backward(grad_o)
-        grad_o = self.attn.backward(grad_o)
-        grad_o = self.LN1.backward(grad_o)
-        return grad_o
+        grad_h = grad_o + self.LN2.backward(self.MLP.backward(grad_o))
+        grad_x = grad_h + self.LN1.backward(self.attn.backward(grad_h))
+        return grad_x
 
     def step(self, lr):
         self.MLP.step(lr)
@@ -367,7 +383,7 @@ class Embed():
         self.hidden_dim = hidden_dim
         self.pos_embed_type = pos_embed
         self.max_seq_len = max_s
-        self.tok_embed = nn.Parameter(torch.normal(0, (1/hidden_dim) ** 0.5, size = (vocab_size, hidden_dim)))
+        self.tok_embed = nn.Parameter(requires_grad = False, data = torch.normal(0, (1/hidden_dim) ** 0.5, size = (vocab_size, hidden_dim)))
         if (pos_embed == "cosine"):
             pos = torch.arange(max_s).unsqueeze(1)
             i = torch.arange(hidden_dim)
@@ -378,7 +394,7 @@ class Embed():
             pe[:, 1::2] = torch.cos(angles[:, 1::2])
             self.pos_embed = pe
         elif (pos_embed == "random"):
-            self.pos_embed = nn.Parameter(torch.normal(0, (1/hidden_dim) ** 0.5, size = (max_s, hidden_dim)))
+            self.pos_embed = nn.Parameter(requires_grad = False, data = torch.normal(0, (1/hidden_dim) ** 0.5, size = (max_s, hidden_dim)))
             # Gradient
             self.grad_pos_embed = torch.zeros(max_s, hidden_dim)
         # For backwards computation later
@@ -424,7 +440,7 @@ class Embed():
 # I will just import a tokenizer
 
 class LLM():
-    def __init__(self, layers: int, hid_dim: int, attn_dim: int, heads: int, vocab_size: int, pos_embed = "cosine", max_s = 30000):
+    def __init__(self, layers: int, hid_dim: int, attn_dim: int, heads: int, vocab_size: int, pos_embed = "cosine", max_s = 30000, tie = False):
         self.name = "Lorial v0"
         self.meta_data = {
             "layers": layers,
@@ -433,14 +449,18 @@ class LLM():
             "attention heads": heads, 
             "position embedding": pos_embed, 
             "vocab size": vocab_size, 
-            "maxmium sequence length": max_s
+            "maxmium sequence length": max_s,
+            "tied embedding": tie
         }
         self.embed = Embed(hid_dim, vocab_size, pos_embed, max_s)
         self.layers = [Transformer_Block(hid_dim, attn_dim, heads) for _ in range(layers)]
         # Pre-norm means nothing renormalizes the residual stream after the last block
         self.ln_f = LayerNorm(hid_dim)
         # Unembedding / vocab projection
-        self.head = linear(hid_dim, vocab_size)
+        # tie: the head owns no weight, it borrows tok_embed (vocab, hid) transposed
+        self.tie = tie
+        self.head = linear(hid_dim, vocab_size,
+                           W = self.embed.tok_embed if tie else None, transpose = tie)
         # How many positions currently sit in the K/V caches; doubles as the position offset
         self._cache_len = 0
 
@@ -461,7 +481,13 @@ class LLM():
         grad_o = self.ln_f.backward(grad_o)
         for block in reversed(self.layers):   # reversed: gradient flows last block -> first
             grad_o = block.backward(grad_o)
-        return self.embed.backward(grad_o)    # returns None, embed is the end of the chain
+        out = self.embed.backward(grad_o)     # ASSIGNS grad_tok_embed from the gather
+        if self.tie:
+            # The tied table is used twice in the forward, so its gradient is the SUM
+            # of both paths. Embed.backward assigns rather than accumulates, so this
+            # has to come after it, not before.
+            self.embed.grad_tok_embed = self.embed.grad_tok_embed + self.head.grad_W
+        return out    # returns None, embed is the end of the chain
 
     def step(self, lr):
         self.embed.step(lr)
