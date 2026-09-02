@@ -193,7 +193,7 @@ class ReLU():
         pass
 
     def params(self):
-        pass
+        return []
 
 
 class LayerNorm():
@@ -307,10 +307,8 @@ class Transformer_Block():
         self.MLP = MLP(dim)
 
     def forward(self, x: torch.Tensor):
-        x = self.LN1(x)
-        x += self.attn(x)
-        x = self.LN2(x)
-        x += self.MLP(x)
+        x = x + self.attn.forward(self.LN1.forward(x))
+        x = x + self.MLP.forward(self.LN2.forward(x))
         return x
 
     def __call__(self, x):
@@ -323,11 +321,11 @@ class Transformer_Block():
         grad_o = self.LN1.backward(grad_o)
         return grad_o
 
-    def step(self):
-        self.MLP.step()
-        self.LN2.step()
-        self.attn.step()
-        self.LN1.step()
+    def step(self, lr):
+        self.MLP.step(lr)
+        self.LN2.step(lr)
+        self.attn.step(lr)
+        self.LN1.step(lr)
 
     def zero_grad(self):
         self.MLP.zero_grad()
@@ -445,7 +443,6 @@ class LLM():
         self.ln_f.zero_grad()
 
     # Generate sentences
-    # TODO: KV_cache generation speedup
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, topk: int = None):
         # idx is (b, s) or just s
         if (len(idx.shape) == 1):
@@ -463,6 +460,8 @@ class LLM():
             next_id = torch.multinomial(prob, num_samples = 1) # shape (b, 1)
             idx = torch.cat([idx, next_id], dim = 1) # shape (b, s+l) where l is the no. loops
         return idx
+
+    # TODO: KV_cache generation
 
     # General utils
     def params(self):
