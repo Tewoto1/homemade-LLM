@@ -3,9 +3,9 @@ Training loop. Everything is manual, so the loop is the whole story:
 
     logits     = model.forward(x)
     loss, grad = cross_entropy_loss(logits, y)   # grad is dL/dlogits
-    model.zero_grad(); model.backward(grad)      # fills every self.grad_*
+    model.zero_grad(); model.backward(grad)      # fills every layer.grads entry
     clip_grad_norm(model, 1.0)
-    model.step(lr)                               # W -= lr * grad_W
+    model.step(lr)                               # W -= lr * layer.grads["W"]
 
 The shift-by-one lives in the data loader, not the loss: get_batch returns
 x = tokens[i : i+s] and y = tokens[i+1 : i+s+1], so logit position j is already
@@ -105,28 +105,30 @@ class PackedData():
         self.tokens, self.seq_len, self.device = tokens, seq_len, device
 
     def __len__(self):
+        # len is the maximum accessible length by get_batch
         return len(self.tokens) - self.seq_len - 1
 
     def get_batch(self, batch_size):
         ix = torch.randint(len(self), (batch_size,)).tolist()
+        # Since our data is pointer to binary, we need to do torch.as_tensor
         x = torch.stack([torch.as_tensor(self.tokens[i : i + self.seq_len].astype("int64")) for i in ix])
         y = torch.stack([torch.as_tensor(self.tokens[i + 1 : i + 1 + self.seq_len].astype("int64")) for i in ix])
         return x.to(self.device), y.to(self.device)
 
     @classmethod
     def from_file(cls, path, seq_len, device = "cpu"):
-        # memmap, not load: a pretraining .bin is routinely bigger than RAM, and we
-        # only ever touch batch_size * seq_len of it at a time
+        # memmap, don't load just create pointers to the dataset
         import numpy as np
         return cls(np.memmap(path, dtype = np.uint16, mode = "r"), seq_len, device)
 
 
 class PaddedData():
-    """Variable-length sequences, right-padded. This is where masking earns its keep.
+    # This class is currently unused lol
+    """Variable-length sequences, right-padded.
 
     Attention needs no extra pad mask as long as padding is on the RIGHT: the causal
     mask already stops real tokens seeing anything after them, and the pad positions'
-    own outputs are thrown away by the loss mask. Left-padding would break that.
+    own outputs are thrown away by the loss mask.
     """
 
     def __init__(self, sequences, seq_len, pad_id = 0, device = "cpu"):
@@ -165,7 +167,7 @@ def prepare(source, out_path, split = "train", text_field = None, limit = None,
 
     tok = AutoTokenizer.from_pretrained(tokenizer)
     eos = tok.eos_token_id
-    if len(tok) > 65535:
+    if len(tok) > 65535: # That's a convenient method for vocab length
         raise SystemExit(f"vocab {len(tok):,} does not fit in uint16")
 
     if source.endswith(".json") or source.endswith(".jsonl"):
@@ -197,9 +199,9 @@ class Trainer():
     def __init__(self, model, data, scheduler, optimizer = None, grad_clip = 1.0,
                  ckpt_dir = "checkpoints"):
         self.model, self.data, self.sched = model, data, scheduler
-        # optimizer: anything with .step(lr) reading the model's grad_* attrs.
+        # optimizer: anything with .step(lr) reading each parameter owner's .grads.
         # None means plain SGD via model.step(lr). loading.named_slots() gives the
-        # (name, owner, param_attr, grad_attr) pairing a stateful optimizer needs.
+        # (name, owner, param_attr, grad_name) pairing a stateful optimizer needs.
         self.optimizer = optimizer
         self.grad_clip, self.ckpt_dir = grad_clip, ckpt_dir
         self.losses, self.step_count = [], 0
@@ -315,6 +317,8 @@ def main():
 
     data = PackedData.from_file(args.data, seq_len = args.seq, device = args.device)
     sched = CosineScheduler(args.lr, warmup = args.warmup, total = args.steps)
+    # If we are not saving the scheduler stats then I think resume just starts at beginning all over again
+    # Like training "somewhat from beginning" of a half trained model, this is not the intent
 
     if args.resume:
         trainer = Trainer.resume(args.resume, data, sched, device = args.device)

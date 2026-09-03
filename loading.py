@@ -2,8 +2,8 @@
 State dicts, checkpoints and device movement.
 
 No nn.Module here, so none of this is free. Everything below rides on one
-convention: a parameter lives in self.X, its gradient in self.grad_X on the same
-object, and containers hold sublayers as attributes or lists. named_slots walks
+convention: a parameter lives in self.X, its gradient in self.grads["X"] on the
+same object, and containers hold sublayers as attributes or lists. named_slots walks
 that with vars(), so adding a layer to model.py cannot silently drop it from a
 checkpoint. Names look like: layers.0.attn.W_Q, layers.0.MLP.layers.0.W, head.W
 """
@@ -20,12 +20,12 @@ def _is_submodule(v):
 
 
 def named_slots(module, prefix = ""):
-    """(name, owner, param_attr, grad_attr) for every learnable tensor.
+    """(name, owner, param_attr, grad_name) for every learnable tensor.
 
-    Yields the owner and attribute NAMES, not the tensors: every backward()
-    reassigns its gradients rather than writing into them, so a cached reference
-    is stale by the next step. Re-read getattr(owner, grad_attr) each time.
+    Yields the owner and names, not the tensors: backward() may replace a gradient,
+    so consumers should read owner.grads[grad_name] each step.
     """
+    grads = getattr(module, "grads", {})
     for key, value in vars(module).items():
         name = prefix + key
         if isinstance(value, nn.Parameter):
@@ -34,8 +34,8 @@ def named_slots(module, prefix = ""):
             # and an optimizer would step it twice per update.
             if key in getattr(module, "shared_params", ()):
                 continue
-            if hasattr(module, "grad_" + key):
-                yield name, module, key, "grad_" + key
+            if key in grads:
+                yield name, module, key, key
         elif isinstance(value, (list, tuple)):
             for i, item in enumerate(value):
                 if _is_submodule(item):
@@ -49,7 +49,7 @@ def named_parameters(model):
 
 
 def named_gradients(model):
-    return [(n, getattr(o, ga)) for n, o, _, ga in named_slots(model)]
+    return [(n, o.grads[gn]) for n, o, _, gn in named_slots(model)]
 
 
 def clip_grad_norm(model, max_norm):
@@ -82,6 +82,10 @@ def to_device(module, device):
             value.data = value.data.to(device)
         elif torch.is_tensor(value):
             setattr(module, key, value.to(device))
+        elif isinstance(value, dict):
+            for item_key, item in value.items():
+                if torch.is_tensor(item):
+                    value[item_key] = item.to(device)
         elif isinstance(value, (list, tuple)):
             for item in value:
                 if _is_submodule(item):
